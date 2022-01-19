@@ -60,6 +60,14 @@ namespace VSCodeEditor.Tests
             [Test]
             public void DefaultSyncSettings_WhenSynced_CreatesProjectFileFromDefaultTemplate()
             {
+#if UNITY_2021_2_OR_NEWER
+                const string versionCSharp = "9.0";
+#elif UNITY_2020_2_OR_NEWER
+                const string versionCSharp = "8.0";
+#else
+                const string versionCSharp = "7.3";
+#endif
+
                 var projectGuid = "ProjectGuid";
                 var synchronizer = m_Builder.WithProjectGuid(projectGuid, m_Builder.Assembly).Build();
 
@@ -72,7 +80,7 @@ namespace VSCodeEditor.Tests
                     "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
                     "<Project ToolsVersion=\"4.0\" DefaultTargets=\"Build\" xmlns=\"http://schemas.microsoft.com/developer/msbuild/2003\">",
                     "  <PropertyGroup>",
-                    "    <LangVersion>latest</LangVersion>",
+                    $"    <LangVersion>{versionCSharp}</LangVersion>",
                     "  </PropertyGroup>",
                     "  <PropertyGroup>",
                     "    <Configuration Condition=\" '$(Configuration)' == '' \">Debug</Configuration>",
@@ -510,7 +518,13 @@ namespace VSCodeEditor.Tests
             [Test]
             public void CheckDefaultLangVersion()
             {
-                CheckOtherArgument(new string[0], "<LangVersion>latest</LangVersion>");
+#if UNITY_2021_2_OR_NEWER        
+                CheckOtherArgument(new string[0], "<LangVersion>9.0</LangVersion>");
+#elif UNITY_2020_2_OR_NEWER        
+                CheckOtherArgument(new string[0], "<LangVersion>8.0</LangVersion>");
+#else
+                CheckOtherArgument(new string[0], "<LangVersion>7.3</LangVersion>");
+#endif
             }
 
             public void CheckOtherArgument(string[] argumentString, params string[] expectedContents)
@@ -579,7 +593,7 @@ namespace VSCodeEditor.Tests
                 XmlDocument scriptProject = XMLUtilities.FromText(csprojFileContents);
                 XMLUtilities.AssertCompileItemsMatchExactly(scriptProject, new[] { "file.cs" });
                 XMLUtilities.AssertNonCompileItemsMatchExactly(scriptProject, new string[0]);
-                Assert.That(csprojFileContents, Does.Match($"<Reference Include=\"reference\">\\W*<HintPath>{Regex.Escape(Path.Combine(SynchronizerBuilder.projectDirectory,referenceDll))}\\W*</HintPath>\\W*</Reference>"));
+                Assert.That(csprojFileContents, Does.Match($"<Reference Include=\"reference\">\\W*<HintPath>{Regex.Escape(Path.Combine(SynchronizerBuilder.projectDirectory, referenceDll))}\\W*</HintPath>\\W*</Reference>"));
             }
 
             [Test]
@@ -756,6 +770,58 @@ namespace VSCodeEditor.Tests
                 Assert.That(bCsprojContent, Does.Not.Match("<DefineConstants>.*;RootedDefine.*</DefineConstants>"));
                 Assert.That(aCsprojContent, Does.Not.Match("<DefineConstants>.*;CHILD_DEFINE.*</DefineConstants>"));
                 Assert.That(aCsprojContent, Does.Match("<DefineConstants>.*;RootedDefine.*</DefineConstants>"));
+            }
+        }
+
+        class OnGenerationProject : ProjectGenerationTestBase 
+        {
+            static bool m_HasCalledOnGeneratedCSProject = false;
+
+            static bool m_isRunningThisTest = false;
+
+            public class OnGenerationCallbacks : AssetPostprocessor 
+            {
+                public static string OnGeneratedCSProject(string path, string content) 
+                {
+                    if(!m_isRunningThisTest) return content;
+
+                    m_HasCalledOnGeneratedCSProject = true;
+                    return content.Replace("fileA", "fileD");
+                }
+            }
+
+            [Test]
+            public void OnGenerationProject_Called()
+            {
+                m_isRunningThisTest = true;
+                
+                var synchronizer = m_Builder.Build();
+                synchronizer.Sync();
+
+                Assert.True(m_HasCalledOnGeneratedCSProject);
+
+                m_isRunningThisTest = false;
+            }
+
+            [Test]
+            public void OnGenerationProject_Modifed()
+            {
+                m_isRunningThisTest = true;
+
+                var files = new[] { "fileA.cs", "fileB.cs", "fileC.cs" };
+                var synchronizer = m_Builder
+                    .WithAssemblyData(files: files)
+                    .Build();
+
+                synchronizer.Sync();
+
+                var csprojFileContents = m_Builder.ReadProjectFile(m_Builder.Assembly);
+                StringAssert.DoesNotContain("fileA.cs", csprojFileContents);
+                StringAssert.Contains("fileD.cs", csprojFileContents);
+                Assert.True(m_HasCalledOnGeneratedCSProject);
+
+                m_isRunningThisTest = false;
+
             }
         }
     }

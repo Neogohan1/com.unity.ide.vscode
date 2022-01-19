@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Security;
 using System.Security.Cryptography;
+using SR = System.Reflection;
 using System.Text;
 using UnityEditor;
 using UnityEditor.Compilation;
@@ -116,6 +117,9 @@ namespace VSCodeEditor
         static readonly string[] k_ReimportSyncExtensions = { ".dll", ".asmdef" };
 
         string[] m_ProjectSupportedExtensions = new string[0];
+
+        string InitialWorkingDirectory;
+
         public string ProjectDirectory { get; }
         IAssemblyNameProvider IGenerator.AssemblyNameProvider => m_AssemblyNameProvider;
 
@@ -143,8 +147,13 @@ namespace VSCodeEditor
         const string k_ProductVersion = "10.0.20506";
         const string k_BaseDirectory = ".";
         const string k_TargetFrameworkVersion = "v4.7.1";
-        const string k_TargetLanguageVersion = "latest";
-
+#if UNITY_2021_2_OR_NEWER        
+        const string k_TargetLanguageVersion = "9.0";
+#elif UNITY_2020_2_OR_NEWER        
+        const string k_TargetLanguageVersion = "8.0";
+#else
+        const string k_TargetLanguageVersion = "7.3";
+#endif
         public ProjectGeneration(string tempDirectory)
             : this(tempDirectory, new AssemblyNameProvider(), new FileIOProvider(), new GUIDProvider()) { }
 
@@ -212,10 +221,58 @@ namespace VSCodeEditor
             return k_ReimportSyncExtensions.Contains(new FileInfo(asset).Extension);
         }
 
+        private static IEnumerable<SR.MethodInfo> GetPostProcessorCallbacks(string name)
+        {
+            return TypeCache
+                .GetTypesDerivedFrom<AssetPostprocessor>()
+                .Select(t => t.GetMethod(name, SR.BindingFlags.Public | SR.BindingFlags.NonPublic | SR.BindingFlags.Static))
+                .Where(m => m != null);
+        }
+
+        static void OnGeneratedCSProjectFiles()
+        {
+            foreach (var method in GetPostProcessorCallbacks(nameof(OnGeneratedCSProjectFiles)))
+            {
+                method.Invoke(null, Array.Empty<object>());
+            }
+        }
+
+        private static string InvokeAssetPostProcessorGenerationCallbacks(string name, string path, string content)
+        {
+            foreach (var method in GetPostProcessorCallbacks(name))
+            {
+                var args = new[] { path, content };
+                var returnValue = method.Invoke(null, args);
+                if (method.ReturnType == typeof(string))
+                {
+                    // We want to chain content update between invocations
+                    content = (string)returnValue;
+                }
+            }
+
+            return content;
+        }
+
+        private static string OnGeneratedCSProject(string path, string content)
+        {
+            return InvokeAssetPostProcessorGenerationCallbacks(nameof(OnGeneratedCSProject), path, content);
+        }
+
+        private static string OnGeneratedSlnSolution(string path, string content)
+        {
+            return InvokeAssetPostProcessorGenerationCallbacks(nameof(OnGeneratedSlnSolution), path, content);
+        }
+
         public void Sync()
         {
+            InitialWorkingDirectory = Environment.CurrentDirectory;
+            Environment.CurrentDirectory = ProjectDirectory;
+
             SetupProjectSupportedExtensions();
             GenerateAndWriteSolutionAndProjects();
+
+            OnGeneratedCSProjectFiles();
+            Environment.CurrentDirectory = InitialWorkingDirectory;
         }
 
         public bool SolutionExists()
@@ -385,24 +442,33 @@ namespace VSCodeEditor
 
         void SyncProjectFileIfNotChanged(string path, string newContents)
         {
+            if (Path.GetExtension(path) == ".csproj")
+            {
+                newContents = OnGeneratedCSProject(path, newContents);
+            }
+
             SyncFileIfNotChanged(path, newContents);
         }
 
         void SyncSolutionFileIfNotChanged(string path, string newContents)
         {
+            newContents = OnGeneratedSlnSolution(path, newContents);
+
             SyncFileIfNotChanged(path, newContents);
         }
 
         void SyncFileIfNotChanged(string filename, string newContents)
         {
-            if (m_FileIOProvider.Exists(filename))
+            try
             {
-                var currentContents = m_FileIOProvider.ReadAllText(filename);
-
-                if (currentContents == newContents)
+                if (m_FileIOProvider.Exists(filename) && newContents == m_FileIOProvider.ReadAllText(filename))
                 {
                     return;
                 }
+            }
+            catch (Exception exception)
+            {
+                Debug.LogException(exception);
             }
 
             m_FileIOProvider.WriteAllText(filename, newContents);
@@ -504,7 +570,9 @@ namespace VSCodeEditor
                 assembly.name,
                 string.Join(";", new[] { "DEBUG", "TRACE" }.Concat(assembly.defines).Concat(responseFilesData.SelectMany(x => x.Defines)).Concat(EditorUserBuildSettings.activeScriptCompilationDefines).Distinct().ToArray()),
                 assembly.compilerOptions.AllowUnsafeCode | responseFilesData.Any(x => x.Unsafe),
-                CreateAnalyzerBlock(otherArguments, assembly));
+                CreateAnalyzerBlock(otherArguments, assembly),
+                Path.GetRelativePath(ProjectDirectory, assembly.compilerOptions.RoslynAnalyzerRulesetPath)
+            );
         }
 
         string CreateAnalyzerBlock(ILookup<string, string> otherArguments, Assembly assembly)
@@ -517,10 +585,10 @@ namespace VSCodeEditor
                 .Concat(m_AssemblyNameProvider.GetRoslynAnalyzerPaths())
 #endif
                 .Distinct()
-                .Select(path => MakeAbsolutePath(path, ProjectDirectory).NormalizePath())
+                .Select(Path.GetFullPath)
                 .ToArray());
         }
-        
+
         private static string MakeAbsolutePath(string path, string projectDirectory)
         {
             return Path.IsPathRooted(path) ? path : Path.Combine(projectDirectory, path);
@@ -586,7 +654,8 @@ namespace VSCodeEditor
             string assemblyName,
             string defines,
             bool allowUnsafe,
-            string analyzerBlock
+            string analyzerBlock,
+            string rulesetFilePath
         )
         {
             builder.Append(@"<?xml version=""1.0"" encoding=""utf-8""?>").Append(k_WindowsNewline);
@@ -625,6 +694,10 @@ namespace VSCodeEditor
             builder.Append(@"    <AddAdditionalExplicitAssemblyReferences>false</AddAdditionalExplicitAssemblyReferences>").Append(k_WindowsNewline);
             builder.Append(@"    <ImplicitlyExpandNETStandardFacades>false</ImplicitlyExpandNETStandardFacades>").Append(k_WindowsNewline);
             builder.Append(@"    <ImplicitlyExpandDesignTimeFacades>false</ImplicitlyExpandDesignTimeFacades>").Append(k_WindowsNewline);
+#if UNITY_2020_2_OR_NEWER
+            if (rulesetFilePath != null)
+              builder.Append(@$"    <CodeAnalysisRuleSet>{rulesetFilePath}</CodeAnalysisRuleSet>").Append(k_WindowsNewline);
+#endif
             builder.Append(@"  </PropertyGroup>").Append(k_WindowsNewline);
             builder.Append(analyzerBlock);
             builder.Append(@"  <ItemGroup>").Append(k_WindowsNewline);
@@ -684,7 +757,7 @@ namespace VSCodeEditor
             file = file.NormalizePath();
             var path = SkipPathPrefix(file, projectDir);
 
-            var packageInfo = m_AssemblyNameProvider.FindForAssetPath(path.NormalizePath());
+            var packageInfo = m_AssemblyNameProvider.FindForAssetPath(path.Replace('\\', '/'));
             if (packageInfo != null)
             {
                 // We have to normalize the path, because the PackageManagerRemapper assumes
