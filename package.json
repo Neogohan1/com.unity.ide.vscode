@@ -1,0 +1,11 @@
+{
+    "name": "com.unity.ide.vscode",
+    "displayName": "Visual Studio Code Editor 1.2.5BETA",
+    "version": "1.2.5",
+    "unity": "2020.3",
+    "description": "This package provides a temporary solution to VS Code Editor bug",
+    "keywords": ["key X", "key Y", "key Z"],
+    "category": "IDE",
+    "dependencies": {
+    }
+}
